@@ -13,6 +13,8 @@ import zstandard
 import fsspec
 import urllib.parse
 from pathlib import Path
+import concurrent.futures
+from functools import partial
 
 try:
     import lzma
@@ -187,40 +189,46 @@ def data_for_op(op, payload_file, out_file, old_file, data_offset, block_size):
             out_file.seek(ext.start_block*block_size)
             out_file.write(b'\x00' * ext.num_blocks*block_size)
     else:
-        print("Unsupported type = %d" % op.type)
+        print(f"Unsupported type = {op.type}")
         sys.exit(-1)
 
     return data
 
-def dump_part(part, payload_file, data_offset, block_size, out_dir, old_dir=None, use_diff=False):
-    sys.stdout.write(f"Processing {part.partition_name} partition")
-    sys.stdout.flush()
-
+def dump_part(part, payload_path, data_offset, block_size, out_dir, old_dir=None, use_diff=False):
+    print(f"Processing {part.partition_name} partition...")
+    
     # Ensure output directory exists
     Path(out_dir).mkdir(exist_ok=True)
     
-    out_file = open(f'{out_dir}/{part.partition_name}.img', 'wb')
-    
-    if use_diff:
-        old_file_path = f'{old_dir}/{part.partition_name}.img'
-        if os.path.exists(old_file_path):
-            old_file = open(old_file_path, 'rb')
+    # We need to open a new file handle for each partition in parallel processing
+    with open_payload_file(payload_path) as payload_file:
+        out_file = open(f'{out_dir}/{part.partition_name}.img', 'wb')
+        
+        if use_diff:
+            old_file_path = f'{old_dir}/{part.partition_name}.img'
+            if os.path.exists(old_file_path):
+                old_file = open(old_file_path, 'rb')
+            else:
+                print(f"Warning: Original image {old_file_path} not found for differential OTA")
+                old_file = None
         else:
-            print(f"\nWarning: Original image {old_file_path} not found for differential OTA")
             old_file = None
-    else:
-        old_file = None
 
-    for op in part.operations:
-        data = data_for_op(op, payload_file, out_file, old_file, data_offset, block_size)
-        sys.stdout.write(".")
-        sys.stdout.flush()
+        operation_count = len(part.operations)
+        completed = 0
+        
+        for op in part.operations:
+            data = data_for_op(op, payload_file, out_file, old_file, data_offset, block_size)
+            completed += 1
+            if completed % 10 == 0 or completed == operation_count:
+                print(f"  {part.partition_name}: {completed}/{operation_count} operations completed")
+        
+        out_file.close()
+        if old_file:
+            old_file.close()
     
-    out_file.close()
-    if old_file:
-        old_file.close()
-    
-    print("Done")
+    print(f"Finished processing {part.partition_name}")
+    return part.partition_name
 
 def main():
     parser = argparse.ArgumentParser(description='OTA payload dumper')
@@ -236,13 +244,15 @@ def main():
                         help='comma-separated list of images to extract (default: all)')
     parser.add_argument('--list', action='store_true',
                         help='list all available partitions in the payload without extracting')
+    parser.add_argument('--workers', type=int, default=os.cpu_count(),
+                        help='number of worker processes (default: number of CPU cores)')
     args = parser.parse_args()
 
     # Ensure output directory exists
     if not os.path.exists(args.out) and not args.list:
         os.makedirs(args.out)
 
-    # Open the payload file (handles local/remote and zip/non-zip)
+    # Open the payload file to extract metadata
     with open_payload_file(args.payload_path) as payload_file:
         # Read and verify the magic header
         magic = payload_file.read(4)
@@ -273,18 +283,45 @@ def main():
                 print(f"  {i+1}. {part.partition_name}")
             return
 
+        # Select partitions to process
         if args.images == "":
-            for part in dam.partitions:
-                dump_part(part, payload_file, data_offset, block_size, args.out, 
-                        args.old if args.diff else None, args.diff)
+            partitions_to_process = dam.partitions
         else:
             images = args.images.split(",")
+            partitions_to_process = []
             for image in images:
                 partition = [part for part in dam.partitions if part.partition_name == image]
                 if partition:
-                    dump_part(partition[0], payload_file, data_offset, block_size, args.out,
-                            args.old if args.diff else None, args.diff)
+                    partitions_to_process.append(partition[0])
                 else:
                     sys.stderr.write(f"Partition {image} not found in payload!\n")
+        
+        # Process partitions in parallel
+        print(f"Starting extraction with {args.workers} worker processes")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+            # Create a partial function with the common arguments
+            dump_part_partial = partial(
+                dump_part,
+                payload_path=args.payload_path,
+                data_offset=data_offset,
+                block_size=block_size,
+                out_dir=args.out,
+                old_dir=args.old if args.diff else None,
+                use_diff=args.diff
+            )
+            
+            # Submit all partitions for processing
+            futures = {executor.submit(dump_part_partial, part): part.partition_name 
+                      for part in partitions_to_process}
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                partition_name = futures[future]
+                try:
+                    result = future.result()
+                    print(f"Successfully extracted {result}")
+                except Exception as exc:
+                    print(f"{partition_name} generated an exception: {exc}")
+
 if __name__ == "__main__":
-    main()                    
+    main()
