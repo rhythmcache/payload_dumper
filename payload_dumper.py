@@ -234,10 +234,12 @@ def main():
                         help='directory with original images for differential OTA (default: old)')
     parser.add_argument('--images', default="",
                         help='comma-separated list of images to extract (default: all)')
+    parser.add_argument('--list', action='store_true',
+                        help='list all available partitions in the payload without extracting')
     args = parser.parse_args()
 
     # Ensure output directory exists
-    if not os.path.exists(args.out):
+    if not os.path.exists(args.out) and not args.list:
         os.makedirs(args.out)
 
     # Open the payload file (handles local/remote and zip/non-zip)
@@ -264,6 +266,13 @@ def main():
         dam.ParseFromString(manifest)
         block_size = dam.block_size
 
+        # If --list is specified, just list the partitions and exit
+        if args.list:
+            print("Available partitions in payload:")
+            for i, part in enumerate(dam.partitions):
+                print(f"  {i+1}. {part.partition_name}")
+            return
+
         if args.images == "":
             for part in dam.partitions:
                 dump_part(part, payload_file, data_offset, block_size, args.out, 
@@ -277,6 +286,5 @@ def main():
                             args.old if args.diff else None, args.diff)
                 else:
                     sys.stderr.write(f"Partition {image} not found in payload!\n")
-
 if __name__ == "__main__":
-    main()
+    main()                    
